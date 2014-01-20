@@ -36,109 +36,120 @@ function extractBoundary(contentType) {
   return contentType.substring(startIndex + 9, endIndex).replace(/"/gi,'');
 }
 
-var MjpegProxy = exports.MjpegProxy = function(mjpegUrl) {
+var MjpegProxy = exports.MjpegProxy = function(mjpegUrl, still_frames) {
   var self = this;
 
   if (!mjpegUrl) throw new Error('Please provide a source MJPEG URL');
 
   self.mjpegOptions = url.parse(mjpegUrl);
+  self.still_frames = still_frames;
+  self.still_frame_idx = 0;
+  self.consumers = [];
+  self.boundary = 'ipcamera';
+  self.on_air = true;
+  self.frames_missed = 50;
 
-  self.audienceResponses = [];
-  self.newAudienceResponses = [];
+  self._handle_data = function(chunk) {
+    var p = chunk.indexOf('--' + self.boundary);
+    if (p >= 0)
+      self.frames_missed = 0;
 
-  self.boundary = null;
-  self.globalMjpegResponse = null;
+    if (!self.on_air)
+      return;
 
-  self.proxyRequest = function(req, res) {
+    for (var i = self.consumers.length; i--;) {
+      var res = self.consumers[i];
 
-    // There is already another client consuming the MJPEG response
-    if (self.audienceResponses.length > 0) {
-      self._newClient(req, res);
-    } else {
-      // Send source MJPEG request
-      var mjpegRequest = http.request(self.mjpegOptions, function(mjpegResponse) {
-        // console.log('request');
-        self.globalMjpegResponse = mjpegResponse;
-        self.boundary = extractBoundary(mjpegResponse.headers['content-type']);
-
-        self._newClient(req, res);
-
-        var lastByte1 = null;
-        var lastByte2 = null;
-
-        mjpegResponse.on('data', function(chunk) {
-          // Fix CRLF issue on iOS 6+: boundary should be preceded by CRLF.
-          if (lastByte1 != null && lastByte2 != null) {
-            var oldheader = '--' + self.boundary;
-            var p = chunk.indexOf(oldheader); // indexOf provided by buffertools
-
-            if (p == 0 && !(lastByte2 == 0x0d && lastByte1 == 0x0a) || p > 1 && !(chunk[p - 2] == 0x0d && chunk[p - 1] == 0x0a)) {
-              var b1 = chunk.slice(0, p);
-              var b2 = new Buffer('\r\n--' + self.boundary);
-              var b3 = chunk.slice(p + oldheader.length);
-              chunk = Buffer.concat([b1, b2, b3]);
-            }
-          }
-
-          lastByte1 = chunk[chunk.length - 1];
-          lastByte2 = chunk[chunk.length - 2];
-
-          for (var i = self.audienceResponses.length; i--;) {
-            var res = self.audienceResponses[i];
-
-            // First time we push data... lets start at a boundary
-            if (self.newAudienceResponses.indexOf(res) >= 0) {
-              var p = chunk.indexOf('--' + self.boundary); // indexOf provided by buffertools
-              if (p >= 0) {
-                res.write(chunk.slice(p));
-                self.newAudienceResponses.splice(self.newAudienceResponses.indexOf(res), 1); // remove from new
-              }
-            } else {
-              res.write(chunk);
-            }
-          }
-        });
-        mjpegResponse.on('end', function () {
-          // console.log("...end");
-          for (var i = self.audienceResponses.length; i--;) {
-            var res = self.audienceResponses[i];
-            res.end();
-          }
-        });
-        mjpegResponse.on('close', function () {
-          // console.log("...close");
-        });
-      });
-
-      mjpegRequest.on('error', function(e) {
-        console.error('problem with request: ', e);
-      });
-      mjpegRequest.end();
+      if (res.is_live) {
+        res.write(chunk);
+      } else {
+        if (p >= 0) {
+          res.write(chunk.slice(p));
+          res.is_live = true;
+        }
+      }
     }
-  }
+  };
 
-  self._newClient = function(req, res) {
+  self._newClient = function(req, res){
     res.writeHead(200, {
       'Expires': 'Mon, 01 Jul 1980 00:00:00 GMT',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Pragma': 'no-cache',
       'Content-Type': 'multipart/x-mixed-replace;boundary=' + self.boundary
     });
+    res.is_live = false;
 
-    self.audienceResponses.push(res);
-    self.newAudienceResponses.push(res);
+    self.consumers.push(res);
 
-    req.socket.on('close', function () {
-      // console.log('exiting client!');
-
-      self.audienceResponses.splice(self.audienceResponses.indexOf(res), 1);
-      if (self.newAudienceResponses.indexOf(res) >= 0) {
-        self.newAudienceResponses.splice(self.newAudienceResponses.indexOf(res), 1); // remove from new
-      }
-
-      if (self.audienceResponses.length == 0) {
-        self.globalMjpegResponse.destroy();
-      }
+    req.socket.on('close', function() {
+      self.consumers.splice(self.consumers.indexOf(res), 1);
     });
-  }
+  };
+
+  self.proxyRequest = function(req, res) {
+    self._newClient(req, res);
+  };
+
+  self._start_request = function() {
+    self.producer_response = null;
+    self.producer_request = http.request(self.mjpegOptions, function(response) {
+      self.producer_response = response;
+      self.boundary = extractBoundary(response.headers['content-type']);
+
+      response.on('data', self._handle_data);
+      response.on('end', function() {
+        /* handle end of camera stream */
+      });
+
+      response.on('close', function() {
+        /* handle close of producer */
+      });
+    });
+    self.producer_request.on('error', function(e) {
+      console.log('Error on producer', e);
+    });
+    self.producer_request.end()
+  };
+
+  self.frame_ticker_interval = 240;
+  self._frame_ticker = function() {
+    self.frames_missed += 1;
+    if (self.frames_missed > (1000 / self.frame_ticker_interval)) {
+      self.frames_missed = -(10000 / self.frame_ticker_interval);
+
+      console.log("No frames received - restarting producer request.");
+
+      if (self.producer_response)
+        self.producer_response.destroy();
+      else if (self.producer_request)
+        self.producer_request.abort();
+      self.producer_request = null;
+      self.producer_response = null;
+      self._start_request();
+    }
+
+    if (self.on_air && self.frames_missed >= 0)
+      return;
+
+    self.still_frame_idx++;
+    if (self.still_frame_idx >= self.still_frames.length)
+        self.still_frame_idx = 0;
+
+    var frame = self.still_frames[self.still_frame_idx];
+
+    var header = '\r\n--' + self.boundary + '\r\n';
+    header += 'Content-Type: image/jpeg\r\n';
+    header += 'Content-Length: ' + frame.length + '\r\n\r\n';
+
+    var buffer = Buffer.concat([ new Buffer(header), frame ]);
+
+    for (var i = self.consumers.length; i--;) {
+      var res = self.consumers[i];
+
+      res.write(buffer);
+      res.is_live = true;
+    }
+  };
+  self.frame_ticker_id = setInterval(self._frame_ticker, self.frame_ticker_interval);
 }
