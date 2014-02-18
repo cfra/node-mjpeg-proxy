@@ -42,6 +42,7 @@ var MjpegProxy = exports.MjpegProxy = function(mjpegUrl, still_frames) {
   if (!mjpegUrl) throw new Error('Please provide a source MJPEG URL');
 
   self.mjpegOptions = url.parse(mjpegUrl);
+  self.mjpegOptions.agent = false;
   self.still_frames = still_frames;
   self.still_frame_idx = 0;
   self.consumers = [];
